@@ -22,6 +22,8 @@ pub struct Config {
     pub bot_token: String,
     pub run_timeout: Duration,
     pub default_harness: String,
+    /// Model assigned to new Bots when none is given explicitly.
+    pub default_model: Option<String>,
 }
 
 struct Run {

@@ -390,3 +390,6 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .bot-pill { max-width: calc(100% - 120px); font-size: 14px; }
   .composer-plus { display: none; }
 }
+
+/* Fixed model deployment: keep the picker out of the way. */
+.model-bar { display: none !important; }

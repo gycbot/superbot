@@ -57,6 +57,7 @@ async fn main() {
     let host = env("HOST", "127.0.0.1");
     let password = env("AUTH_PASSWORD", "");
     let default_harness = env("DEFAULT_HARNESS", "claude");
+    let default_model = env("DEFAULT_MODEL", "");
     if password.is_empty() && !["127.0.0.1", "localhost", "::1"].contains(&host.as_str()) {
         eprintln!("Refusing to listen on a public address without AUTH_PASSWORD.");
         std::process::exit(1);
@@ -86,12 +87,13 @@ async fn main() {
         bot_token: random_bytes(24).iter().map(|x| format!("{x:02x}")).collect(),
         run_timeout: Duration::from_secs(60 * env("RUN_TIMEOUT_MINUTES", "60").parse::<u64>().unwrap_or(60)),
         default_harness,
+        default_model: if default_model.is_empty() { None } else { Some(default_model) },
     }, screens);
 
     // First start: create the primary Bot.
     if app.db.bots().is_empty() {
         let name = env("PRIMARY_BOT_NAME", "Assistant");
-        let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &app.cfg.default_harness, None, true);
+        let bot = app.db.create_bot(&name, "#f5f5f5", "waddle", &app.cfg.default_harness, app.cfg.default_model.as_deref(), true);
         app.init_bot_files(&bot);
     }
 
@@ -316,12 +318,13 @@ async fn create_bot(State(app): State<AppState>, Json(v): Json<Value>) -> Res<(S
     let p = bot_patch(&v)?;
     let name = p.name.ok_or_else(|| bad("Name is required"))?;
     let harness = p.harness.unwrap_or_else(|| app.cfg.default_harness.clone());
+    let model = p.model.flatten().or_else(|| app.cfg.default_model.clone());
     let bot = app.db.create_bot(
         &name,
         p.color.as_deref().unwrap_or(pick(&COLORS)),
         p.shape.as_deref().unwrap_or(pick(&SHAPES)),
         &harness,
-        p.model.flatten().as_deref(),
+        model.as_deref(),
         false,
     );
     app.init_bot_files(&bot);
