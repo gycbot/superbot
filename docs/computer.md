@@ -30,17 +30,14 @@ The script also adds 4 GB of swap and earlyoom, which kills the biggest Chrome b
 
 ## Proxy
 
-The live view needs `/screen/<port>/` routed to that local voxl port. With Caddy:
+`botd` proxies `/screen/<port>/` to that local voxl port itself, WebSocket upgrade
+included, so the live view works through the same port or tunnel as the web app.
+Only ports 6800 to 6999 are proxied. Ports are `6800 + SCREEN_BASE + slot`: 6901,
+6902, ... by default. voxl checks its own token, and the app's login still guards
+the proxy route.
 
-```
-@screen path_regexp screen ^/screen/(69[0-9][0-9])/
-handle @screen {
-	uri strip_prefix /screen/{re.screen.1}
-	reverse_proxy 127.0.0.1:{re.screen.1}
-}
-```
-
-Ports are `6800 + SCREEN_BASE + slot`: 6901, 6902, ... by default. voxl checks its own token, so the route needs no extra login.
+No Caddy or nginx rule is needed. If you do put one in front, pass the path through
+unchanged, and don't buffer or rewrite `/screen/`.
 
 ## Sizing
 

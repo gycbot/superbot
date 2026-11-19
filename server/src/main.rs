@@ -112,6 +112,7 @@ async fn main() {
         .route("/ask", post(ask))
         .route("/handoff", post(handoff));
     let router = Router::new()
+        .route("/screen/{*path}", get(screen_proxy))
         .nest("/api", api)
         .fallback(get(web))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
@@ -212,6 +213,61 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 // Web app: embedded in the binary. Set WEB_DIR to serve from disk while editing it.
+
+// Screens: the live view is served from a local voxl port. Proxy it here so the
+// web app works without a reverse proxy in front, on whatever port or tunnel it
+// is reached through. Only the screen port range is proxied, and the connection
+// is upgraded in place for voxl's WebSocket.
+async fn screen_proxy(Path(path): Path<String>, mut req: Request) -> Response {
+    let (port, rest) = match path.split_once('/') {
+        Some((p, r)) => (p, r),
+        None => (path.as_str(), ""),
+    };
+    let port: u16 = match port.parse() {
+        Ok(p) if (6800..7000).contains(&p) => p,
+        _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
+    };
+    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let uri = format!("http://127.0.0.1:{port}/{rest}{query}");
+
+    let stream = match tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+        Ok(s) => s,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "That screen is not running.").into_response(),
+    };
+    let (mut sender, conn) = match hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await {
+        Ok(v) => v,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "That screen is not running.").into_response(),
+    };
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
+
+    // Held before the body is taken so a WebSocket upgrade can be relayed.
+    let down = hyper::upgrade::on(&mut req);
+    let mut up = Request::builder().method(req.method()).uri(&uri);
+    for (k, v) in req.headers() {
+        up = up.header(k, v);
+    }
+    let up = match up.body(req.into_body()) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_REQUEST, "Bad request").into_response(),
+    };
+    let mut res = match sender.send_request(up).await {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_GATEWAY, "That screen is not running.").into_response(),
+    };
+    if res.status() == StatusCode::SWITCHING_PROTOCOLS {
+        let upg = hyper::upgrade::on(&mut res);
+        tokio::spawn(async move {
+            if let (Ok(a), Ok(b)) = tokio::join!(down, upg) {
+                let (mut a, mut b) = (hyper_util::rt::TokioIo::new(a), hyper_util::rt::TokioIo::new(b));
+                let _ = tokio::io::copy_bidirectional(&mut a, &mut b).await;
+            }
+        });
+    }
+    let (parts, body) = res.into_parts();
+    Response::from_parts(parts, axum::body::Body::new(body))
+}
 
 async fn web(uri: axum::http::Uri) -> Response {
     let path = uri.path();

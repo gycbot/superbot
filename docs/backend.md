@@ -48,6 +48,10 @@ Settings are in [.env.example](../.env.example). Keep `botctl` next to `botd`: t
 - Install the harness CLIs you want and log them in **as the user that runs `botd`**: `claude` (then `claude login` or `ANTHROPIC_API_KEY`), `codex` (`codex login` or `OPENAI_API_KEY`), `pi` (provider API key, e.g. `OPENROUTER_API_KEY`). Their env vars pass through to the Bots.
 - Run `botd` as a normal user, not root. Claude Code refuses to skip permissions as root.
 - Run it under systemd with `Restart=always`. It shuts down cleanly on SIGTERM.
+- Back up `DATA_DIR` daily. `deploy/backup.sh` tars it to `/home/ubuntu/backups` and keeps 7 copies:
+  ```sh
+  echo '0 4 * * * ubuntu /path/to/superbot/deploy/backup.sh' | sudo tee /etc/cron.d/superbot-backup
+  ```
 - Put HTTPS in front (e.g. Caddy) and set `AUTH_PASSWORD` and `HOST=0.0.0.0`, or keep `HOST=127.0.0.1` behind the proxy. The browser logs in with any username and that password.
 - Proxies must not buffer `/api/events` (it's an SSE stream).
 - Set `TZ` to the user's time zone. Routines use it.
