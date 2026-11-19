@@ -40,6 +40,9 @@
 
     <main class="chat">
       <header class="chat-header">
+        <button class="icon-btn menu-btn" id="menu-btn" title="Bots" aria-label="Open bot list">
+          <svg viewBox="0 0 24 24"><path d="M4 7h16M4 12h16M4 17h16"/></svg>
+        </button>
         <div class="bot-pill" id="bot-pill"></div>
         <button class="share-btn screen-btn" id="screen-btn" title="Watch this Bot's screen">Screen</button>
         <button class="share-btn">Share</button>
@@ -87,6 +90,7 @@
         <div class="screen-msg" id="screen-msg" hidden></div>
       </div>
     </aside>
+    <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
   </div>
   <div class="modal-backdrop" id="nb" hidden>
     <form class="modal" id="nb-form" autocomplete="off">
@@ -111,5 +115,19 @@
     </form>
   </div>
   <script src="app.js"></script>
+  <script>
+    (function () {
+      const app = document.querySelector(".app");
+      const btn = document.getElementById("menu-btn");
+      const backdrop = document.getElementById("sidebar-backdrop");
+      const close = () => app.classList.remove("nav-open");
+      btn.addEventListener("click", () => app.classList.toggle("nav-open"));
+      backdrop.addEventListener("click", close);
+      document.getElementById("bot-list").addEventListener("click", close);
+      document.getElementById("primary-bot").addEventListener("click", close);
+      document.getElementById("screen-btn").addEventListener("click", close);
+      document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    })();
+  </script>
 </body>
 </html>
