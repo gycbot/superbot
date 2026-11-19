@@ -58,6 +58,8 @@ function md(src) {
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
     .replace(/(^|[^*])\*([^*\n]+)\*/g, "$1<em>$2</em>")
+    .replace(/!\[([^\]]*)\]\((\/attachments\/[^)\s]+)\)/g, '<img src="$2" alt="$1" class="chat-media" />')
+    .replace(/\[video\]\((\/attachments\/[^)\s]+)\)/g, '<video src="$1" controls class="chat-media" />')
     .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>')
     .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, '$1<a href="$2" target="_blank" rel="noopener">$2</a>');
   return s.split(/\n{2,}/).map((para) => {
@@ -143,6 +145,16 @@ function when(ts) {
   return `${d.toLocaleDateString([], { month: "short", day: "numeric" })} ${time}`;
 }
 
+function renderAtts(atts) {
+  if (!atts?.length) return "";
+  return atts.map((a) => {
+    const url = `/attachments/${encodeURIComponent(a.id)}`;
+    if (a.kind === "image") return `<img src="${url}" alt="${esc(a.name || "image")}" class="chat-media" />`;
+    if (a.kind === "video") return `<video src="${url}" controls class="chat-media" />`;
+    return `<a class="file-att" href="${url}" target="_blank" rel="noopener">${esc(a.name || "file")}</a>`;
+  }).join("");
+}
+
 function renderMessage(m, prev) {
   let out = !prev || m.at - prev.at > 30 * 60000 ? `<div class="timestamp">${when(m.at)}</div>` : "";
   if (m.role === "routine") return out + `<div class="timestamp routine">Routine · ${esc(m.text)}</div>`;
@@ -151,9 +163,9 @@ function renderMessage(m, prev) {
     const label = m.role === "peer" ? `From ${esc(who)}` : `Reply from ${esc(who)}`;
     return out + `<div class="msg-row peer"><div class="bubble"><div class="from">${label}</div>${md(m.text)}</div></div>`;
   }
-  if (m.role === "user") return out + `<div class="msg-row user"><div class="bubble">${esc(m.text).replace(/\n/g, "<br>")}</div></div>`;
+  if (m.role === "user") return out + `<div class="msg-row user"><div class="bubble">${esc(m.text).replace(/\n/g, "<br>")}${renderAtts(m.attachments)}</div></div>`;
   if (m.text) {
-    out += `<div class="msg-row bot" data-id="${m.id}"><div class="bubble ${m.error ? "error" : ""}">${md(m.text)}</div>${ACTIONS}</div>`;
+    out += `<div class="msg-row bot" data-id="${m.id}"><div class="bubble ${m.error ? "error" : ""}">${md(m.text)}${renderAtts(m.attachments)}</div>${ACTIONS}</div>`;
   }
   if (m.question) {
     const q = m.question;
@@ -217,12 +229,60 @@ function markRead() {
   }
 }
 
+// Files selected for the next message (uploaded immediately, attached on send).
+const pendingAtts = [];
+
+function renderPending() {
+  const el = $("pending-files");
+  if (!el) return;
+  el.innerHTML = pendingAtts.length
+    ? pendingAtts.map((a, i) => `<span class="pending-chip">${a.kind === "image" ? "🖼" : a.kind === "video" ? "🎬" : "📎"} ${esc(a.name)} <b data-rm="${i}">×</b></span>`).join("")
+    : "";
+}
+
+$("attach-btn")?.addEventListener("click", () => $("file-input").click());
+$("file-input")?.addEventListener("change", async (e) => {
+  const files = [...e.target.files];
+  e.target.value = "";
+  for (const file of files) {
+    try {
+      const res = await fetch("/api/upload", {
+        method: "POST",
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": btoa(unescape(encodeURIComponent(file.name))),
+        },
+        body: file,
+      });
+      if (!res.ok) {
+        let err = {};
+        try { err = await res.json(); } catch {}
+        throw new Error(err.error || `Upload failed (${res.status})`);
+      }
+      pendingAtts.push(...(await res.json()));
+    } catch (err) {
+      alert(err.message);
+    }
+  }
+  renderPending();
+});
+$("pending-files")?.addEventListener("click", (e) => {
+  const rm = e.target.closest("[data-rm]");
+  if (!rm) return;
+  pendingAtts.splice(+rm.dataset.rm, 1);
+  renderPending();
+});
+
 async function sendText(text, answer) {
   const b = bot(activeId);
   if (!b || !text) return;
+  const atts = pendingAtts.splice(0);
+  renderPending();
   try {
-    await api("POST", `/api/bots/${b.id}/messages`, { text, answer });
+    await api("POST", `/api/bots/${b.id}/messages`, { text, answer, ...(atts.length ? { attachments: atts } : {}) });
   } catch (err) {
+    pendingAtts.unshift(...atts);
+    renderPending();
     alert(err.message);
   }
 }
@@ -295,7 +355,7 @@ async function loadScreen() {
   try {
     const { url } = await api("GET", `/api/bots/${id}/screen`); // also keeps it running while you watch
     if (id !== activeId || $("screen").hidden) return;
-    if (frame.dataset.url !== url) { frame.dataset.url = url; frame.src = url; setTakeover(false); }
+    if (frame.dataset.url !== url) { frame.dataset.url = url; frame.src = url; setTakeover(true); }
     $("screen-msg").hidden = true;
   } catch (err) {
     frame.removeAttribute("src"); delete frame.dataset.url;
@@ -322,6 +382,11 @@ $("screen-take").addEventListener("click", () => {
   const on = !$("screen-shield").hidden;
   setTakeover(on);
   if (on) $("screen-frame").focus();
+});
+// 点击遮罩也直接接管，省去先找按钮
+$("screen-shield").addEventListener("click", () => {
+  setTakeover(true);
+  $("screen-frame").focus();
 });
 
 // Live updates

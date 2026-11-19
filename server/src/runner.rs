@@ -169,12 +169,24 @@ impl App {
         self.init_bot_files(&bot);
         self.db.set_status(msg.id, "running");
         let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
-        let prompt = match msg.role.as_str() {
+        let mut prompt = match msg.role.as_str() {
             "routine" => format!("(Scheduled routine) {}", msg.text),
             "peer" => format!("(Message from {}, another Bot. Your reply goes back to them, not the user.)\n\n{}", from(), msg.text),
             "reply" => format!("(Reply from {} to what you asked earlier. Tell the user what matters.)\n\n{}", from(), msg.text),
             _ => msg.text.clone(),
         };
+        // Tell the harness about files the user attached so it can inspect them with its tools.
+        if let Some(arr) = msg.attachments.as_ref().and_then(|a| a.as_array())
+            && !arr.is_empty() {
+            let lines: Vec<String> = arr.iter().map(|a| {
+                let kind = a["kind"].as_str().unwrap_or("file");
+                let name = a["name"].as_str().unwrap_or("file");
+                let id = a["id"].as_str().unwrap_or("");
+                format!("- [{}] {} — {}", kind, name, self.cfg.data_dir.join("uploads").join(id).display())
+            }).collect();
+            prompt.push_str("\n\n[User attached files — you may read/inspect these paths with your tools]\n");
+            prompt.push_str(&lines.join("\n"));
+        }
 
         for attempt in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
@@ -334,8 +346,10 @@ impl App {
 
     /// Saves one Bot chat bubble. A trailing ```question block becomes a choice card.
     pub fn say(&self, bot_id: &str, text: &str, error: bool) {
-        let (text, question) = split_question(text);
-        let m = self.db.add_message(bot_id, "bot", text.trim(), question.as_ref(), error, None);
+        let (body, question) = split_question(text);
+        let (body, atts) = collect_media(self, body);
+        let attachments = (!atts.is_empty()).then(|| Value::Array(atts));
+        let m = self.db.add_message_full(bot_id, "bot", body.trim(), question.as_ref(), error, None, None, attachments.as_ref());
         self.db.update_bot(bot_id, BotPatch { unread: Some(true), ..Default::default() });
         self.push_message(&m);
     }
@@ -444,6 +458,82 @@ Current time: {now}."#,
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )
     }
+}
+
+/// Copy a local file referenced by a Bot into the uploads dir and describe it.
+fn store_local_file(app: &App, path: &str) -> Option<Value> {
+    let trimmed = path.trim();
+    if trimmed.is_empty() || trimmed.starts_with("http://") || trimmed.starts_with("https://")
+        || trimmed.starts_with("/attachments/") || trimmed.starts_with("data:") { return None; }
+    let p = if std::path::Path::new(trimmed).is_absolute() {
+        std::path::PathBuf::from(trimmed)
+    } else {
+        app.cfg.workspace.join(trimmed)
+    };
+    if !p.is_file() { return None; }
+    let ext = p.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+    let (mime, kind) = match ext.as_str() {
+        "png" => ("image/png", "image"), "jpg" | "jpeg" => ("image/jpeg", "image"),
+        "gif" => ("image/gif", "image"), "webp" => ("image/webp", "image"),
+        "svg" => ("image/svg+xml", "image"), "ico" => ("image/x-icon", "image"),
+        "mp4" => ("video/mp4", "video"), "webm" => ("video/webm", "video"),
+        "mov" => ("video/quicktime", "video"), "mkv" => ("video/x-matroska", "video"),
+        _ => return None,
+    };
+    let id: String = (0..16).map(|_| format!("{:02x}", fastrand_byte())).collect();
+    let dir = app.cfg.data_dir.join("uploads");
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::copy(&p, dir.join(format!("{id}.{ext}"))).ok()?;
+    Some(json!({ "id": id, "name": p.file_name().unwrap_or_default().to_string_lossy(), "mime": mime, "kind": kind }))
+}
+
+fn fastrand_byte() -> u8 {
+    use std::io::Read;
+    let mut b = [0u8; 1];
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map(|_| b[0])
+        .unwrap_or_else(|_| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() & 0xff) as u8)
+}
+
+/// Rewrite markdown media links that point at local files into /attachments URLs,
+/// returning the rewritten text and the attachment descriptors to save on the message.
+fn collect_media(app: &App, text: &str) -> (String, Vec<Value>) {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut atts = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let is_img = bytes[i..].starts_with(b"![");
+        let is_vid = bytes[i..].starts_with(b"[video](");
+        if is_img || is_vid {
+            let search_from = if is_img { i + 2 } else { i + 8 };
+            let (path_start, prefix_end) = if is_img {
+                match text[search_from..].find("](") {
+                    Some(p) => (search_from + p + 2, search_from + p + 2),
+                    None => (0, 0),
+                }
+            } else {
+                (search_from, search_from)
+            };
+            if path_start > 0 {
+                if let Some(end) = text[path_start..].find(')') {
+                    let path = &text[path_start..path_start + end];
+                    let whole_end = path_start + end + 1;
+                    if let Some(att) = store_local_file(app, path) {
+                        out.push_str(&text[i..prefix_end]);
+                        out.push_str(&format!("/attachments/{}", att["id"].as_str().unwrap_or("")));
+                        out.push(')');
+                        atts.push(att);
+                        i = whole_end;
+                        continue;
+                    }
+                }
+            }
+        }
+        let ch = text[i..].chars().next().unwrap();
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    (out, atts)
 }
 
 /// Splits off a trailing ```question {json}``` block.

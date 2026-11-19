@@ -54,8 +54,10 @@
         <svg viewBox="0 0 24 24"><path d="M12 5v14M6 13l6 6 6-6"/></svg>
       </button>
 
+      <div class="pending-files" id="pending-files"></div>
+      <input type="file" id="file-input" accept="image/*,video/*" multiple hidden />
       <form class="composer" id="composer">
-        <button type="button" class="composer-plus" title="Attach">
+        <button type="button" class="composer-plus" id="attach-btn" title="Attach image or video">
           <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
         </button>
         <input id="input" autocomplete="off" />
@@ -86,7 +88,7 @@
       </div>
       <div class="screen-view">
         <iframe id="screen-frame" title="Bot screen" allow="clipboard-read; clipboard-write"></iframe>
-        <div class="screen-shield" id="screen-shield" title="Click Take over to use this screen"></div>
+        <div class="screen-shield" id="screen-shield" title="Click to control this screen" hidden></div>
         <div class="screen-msg" id="screen-msg" hidden></div>
       </div>
     </aside>

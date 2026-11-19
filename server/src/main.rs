@@ -7,8 +7,9 @@ mod db;
 mod runner;
 mod screen;
 
-use axum::extract::{Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::body::Bytes;
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -109,12 +110,15 @@ async fn main() {
         .route("/bots/{id}/routines", get(list_routines).post(create_routine))
         .route("/routines/{id}", patch(update_routine).delete(delete_routine))
         .route("/bots/{id}/screen", get(screen_info))
+        .route("/upload", post(upload))
         .route("/ask", post(ask))
         .route("/handoff", post(handoff));
     let router = Router::new()
         .route("/screen/{*path}", get(screen_proxy))
+        .route("/attachments/{id}", get(attachment))
         .nest("/api", api)
         .fallback(get(web))
+        .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(middleware::from_fn_with_state(app.clone(), auth))
         .route("/healthz", get(|| async { Json(json!({ "ok": true })) }))
         .with_state(app.clone());
@@ -450,10 +454,68 @@ async fn send_message(State(app): State<AppState>, Path(id): Path<String>, Json(
         let _ = tx.send(text);
         return Ok((StatusCode::ACCEPTED, Json(json!(msg))));
     }
-    let msg = app.db.add_message(&id, "user", &text, None, false, Some("queued"));
+    // Optional attachments uploaded beforehand via POST /api/upload.
+    let attachments = v["attachments"].as_array().filter(|a| !a.is_empty()).map(|a| Value::Array(a.clone()));
+    let msg = app.db.add_message_full(&id, "user", &text, None, false, Some("queued"), None, attachments.as_ref());
     app.push_message(&msg);
     app.enqueue(msg.clone());
     Ok((StatusCode::ACCEPTED, Json(json!(msg))))
+}
+
+/// Upload one image/video/file. Raw body with X-File-Name (base64) + Content-Type.
+/// Stored under DATA_DIR/uploads and returns attachment descriptors for messages.
+async fn upload(State(app): State<AppState>, headers: HeaderMap, body: Bytes) -> Res {
+    if body.is_empty() { return Err(bad("Empty file")); }
+    if body.len() > 50 * 1024 * 1024 { return Err(bad("File too large (max 50 MB)")); }
+    let name = headers.get("x-file-name")
+        .and_then(|v| v.to_str().ok())
+        .and_then(base64_decode)
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_else(|| "file".into());
+    let mime = headers.get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .split(';').next().unwrap_or("application/octet-stream").trim().to_string();
+    let kind = if mime.starts_with("image/") { "image" }
+        else if mime.starts_with("video/") { "video" } else { "file" };
+    let ext = match mime.as_str() {
+        "image/png" => "png", "image/jpeg" => "jpg", "image/gif" => "gif",
+        "image/webp" => "webp", "image/svg+xml" => "svg", "image/x-icon" => "ico",
+        "video/mp4" => "mp4", "video/webm" => "webm", "video/quicktime" => "mov",
+        _ => "bin",
+    };
+    let id: String = random_bytes(16).iter().map(|b| format!("{b:02x}")).collect();
+    let dir = app.cfg.data_dir.join("uploads");
+    std::fs::create_dir_all(&dir).map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    std::fs::write(dir.join(format!("{id}.{ext}")), &body)
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+    Ok(Json(json!([{ "id": id, "name": name, "mime": mime, "kind": kind }])))
+}
+
+/// Serve an uploaded attachment. No SNI needed; Basic auth applies (same as the app).
+async fn attachment(State(app): State<AppState>, Path(id): Path<String>) -> Response {
+    if !id.chars().all(|c| c.is_ascii_hexdigit()) || id.is_empty() {
+        return (StatusCode::NOT_FOUND, "Not found").into_response();
+    }
+    let dir = app.cfg.data_dir.join("uploads");
+    let found = std::fs::read_dir(&dir).ok().and_then(|rd| {
+        rd.flatten().find(|e| e.file_name().to_string_lossy().starts_with(&format!("{id}."))).map(|e| e.path())
+    });
+    let Some(path) = found else { return (StatusCode::NOT_FOUND, "Not found").into_response() };
+    let bytes = match std::fs::read(&path) { Ok(b) => b, Err(_) => return (StatusCode::NOT_FOUND, "Not found").into_response() };
+    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("bin");
+    let mime = match ext {
+        "png" => "image/png", "jpg" => "image/jpeg", "gif" => "image/gif",
+        "webp" => "image/webp", "svg" => "image/svg+xml", "ico" => "image/x-icon",
+        "mp4" => "video/mp4", "webm" => "video/webm", "mov" => "video/quicktime",
+        _ => "application/octet-stream",
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, mime)
+        .header(header::CACHE_CONTROL, "public, max-age=86400")
+        .body(axum::body::Body::from(bytes))
+        .unwrap()
 }
 
 // Bot to Bot: `botctl ask`. Waits for the reply and returns it as plain text.

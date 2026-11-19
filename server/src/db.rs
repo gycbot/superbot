@@ -40,6 +40,8 @@ pub struct Message {
     /// For "peer" and "reply" messages: the other Bot's id.
     #[serde(rename = "fromBot")]
     pub from_bot: Option<String>,
+    /// Attached images/videos/files: [{ id, name, mime, kind }]
+    pub attachments: Option<Value>,
     #[serde(rename = "at")]
     pub created_at: i64,
 }
@@ -94,6 +96,7 @@ fn bot_row(r: &Row) -> rusqlite::Result<Bot> {
 
 fn message_row(r: &Row) -> rusqlite::Result<Message> {
     let q: Option<String> = r.get("question")?;
+    let a: Option<String> = r.get("attachments").unwrap_or(None);
     Ok(Message {
         id: r.get("id")?,
         bot_id: r.get("bot_id")?,
@@ -103,6 +106,7 @@ fn message_row(r: &Row) -> rusqlite::Result<Message> {
         error: r.get("error")?,
         status: r.get("status")?,
         from_bot: r.get("from_bot")?,
+        attachments: a.and_then(|s| serde_json::from_str(&s).ok()),
         created_at: r.get("created_at")?,
     })
 }
@@ -147,6 +151,7 @@ impl Db {
               question TEXT,
               error INTEGER NOT NULL DEFAULT 0,
               status TEXT,
+              attachments TEXT,
               created_at INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS messages_bot ON messages(bot_id, id);
@@ -163,6 +168,7 @@ impl Db {
         )?;
         // Added after the first release; fails harmlessly if it already exists.
         let _ = c.execute("ALTER TABLE messages ADD COLUMN from_bot TEXT", []);
+        let _ = c.execute("ALTER TABLE messages ADD COLUMN attachments TEXT", []);
         let _ = c.execute("ALTER TABLE bots ADD COLUMN effort TEXT", []);
         Ok(Db(Mutex::new(c)))
     }
@@ -246,10 +252,16 @@ impl Db {
 
     #[allow(clippy::too_many_arguments)]
     pub fn add_message_from(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>, from_bot: Option<&str>) -> Message {
+        self.add_message_full(bot_id, role, text, question, error, status, from_bot, None)
+    }
+
+    /// Full insert including attachments (images/videos/files).
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_message_full(&self, bot_id: &str, role: &str, text: &str, question: Option<&Value>, error: bool, status: Option<&str>, from_bot: Option<&str>, attachments: Option<&Value>) -> Message {
         let c = self.c();
         c.execute(
-            "INSERT INTO messages (bot_id, role, text, question, error, status, from_bot, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            params![bot_id, role, text, question.map(|q| q.to_string()), error, status, from_bot, now()],
+            "INSERT INTO messages (bot_id, role, text, question, error, status, from_bot, attachments, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            params![bot_id, role, text, question.map(|q| q.to_string()), error, status, from_bot, attachments.map(|a| a.to_string()), now()],
         )
         .unwrap();
         let id = c.last_insert_rowid();
