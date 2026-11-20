@@ -291,7 +291,7 @@ function render(keepScroll) {
   renderSidebar();
   renderChat(keepScroll);
   renderModelBar();
-  if (details.open && document.activeElement?.id !== "d-name") renderDetails();
+  if (details.open && document.activeElement?.id !== "d-name" && !document.activeElement?.closest?.("#d-routine-form")) renderDetails();
 }
 
 // Model and effort picker above the input. Saved on the Bot, so each Bot keeps its own.
@@ -529,18 +529,85 @@ const ICONS = {
   job: '<svg viewBox="0 0 24 24"><rect x="4" y="7" width="16" height="12" rx="2"/><path d="M9 7V5.5A1.5 1.5 0 0 1 10.5 4h3A1.5 1.5 0 0 1 15 5.5V7"/></svg>',
   chevron: '<svg viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></svg>',
   trash: '<svg viewBox="0 0 24 24"><path d="M5 7h14M10 7V5h4v2M7 7l1 12h8l1-12"/></svg>',
+  plus: '<svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>',
 };
-const details = { open: false, tab: "activity", routines: [] };
+const details = { open: false, tab: "activity", routines: [], form: null };
+
+// Human hint for the simplest cron shapes; returns "" when it isn't sure.
+const CRON_DAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+function cronHint(cron) {
+  const p = String(cron || "").trim().split(/\s+/);
+  if (p.length !== 5) return "";
+  const [mi, hr, dom, mon, dow] = p;
+  const num = (s) => (/^\d{1,2}$/.test(s) ? +s : null);
+  const m = num(mi), h = num(hr), d = num(dom), w = num(dow);
+  const time = (M, H) => `${String(H).padStart(2, "0")}:${String(M).padStart(2, "0")}`;
+  if (mi === "*" && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "Every minute";
+  const every = mi.match(/^\*\/(\d{1,2})$/);
+  if (every && hr === "*" && dom === "*" && mon === "*" && dow === "*") return `Every ${every[1]} min`;
+  if (mi === "0" && hr === "*" && dom === "*" && mon === "*" && dow === "*") return "Hourly";
+  if (m != null && h != null && m <= 59 && h <= 23 && dom === "*" && mon === "*" && dow === "*") return `Daily at ${time(m, h)}`;
+  if (m != null && h != null && m <= 59 && h <= 23 && dom === "*" && mon === "*" && w != null && w <= 6) return `${CRON_DAYS[w]}s at ${time(m, h)}`;
+  if (m != null && h != null && m <= 59 && h <= 23 && d != null && d >= 1 && d <= 31 && mon === "*" && dow === "*") return `Monthly on day ${d} at ${time(m, h)}`;
+  return "";
+}
+
+function lastRunText(ms) {
+  if (ms == null || !ms) return "Never run";
+  const d = new Date(ms);
+  const p = (n) => String(n).padStart(2, "0");
+  return `Last run ${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function routineFormHtml() {
+  const f = details.form;
+  const editing = f.mode === "edit";
+  return `<form class="d-routine-form" id="d-routine-form" autocomplete="off">
+    <div class="d-form-title">${editing ? "Edit routine" : "New routine"}</div>
+    <label class="d-field"><span>Name</span>
+      <input class="d-input" data-f="name" value="${esc(f.name)}" placeholder="Morning brief" maxlength="80" /></label>
+    <label class="d-field"><span>Cron</span>
+      <input class="d-input" data-f="cron" value="${esc(f.cron)}" placeholder="0 9 * * *" spellcheck="false" /></label>
+    <label class="d-field"><span>Instruction</span>
+      <textarea class="d-input" data-f="instruction" rows="6" placeholder="What should this Bot do when the routine runs?">${esc(f.instruction)}</textarea></label>
+    <div class="d-form-actions">
+      <button type="button" class="d-btn" id="d-routine-cancel">Cancel</button>
+      <button type="submit" class="d-btn primary" id="d-routine-save">Save</button>
+    </div>
+  </form>`;
+}
+
+function routineRowHtml(r) {
+  const toggle = (on, attrs) => `<button type="button" class="switch ${on ? "on" : ""}" ${attrs}><span></span></button>`;
+  if (details.form?.mode === "edit" && String(details.form.id) === String(r.id)) return routineFormHtml();
+  const hint = cronHint(r.cron);
+  return `<div class="d-routine">
+    <div class="d-item d-routine-main">
+      <div class="d-text">
+        <div class="d-rname">${esc(r.name)}</div>
+        <div class="d-sub">${esc(r.cron)}${hint ? ` · ${esc(hint)}` : ""}</div>
+        <div class="d-sub d-last">${esc(lastRunText(r.last_run_at))}</div>
+      </div>
+      ${toggle(r.enabled, `data-routine="${r.id}" title="${r.enabled ? "Pause" : "Resume"}" aria-label="${r.enabled ? "Pause" : "Resume"}"`)}
+    </div>
+    <div class="d-tools">
+      <button type="button" class="d-icon" data-run="${r.id}" title="Run now" aria-label="Run now">▶</button>
+      <button type="button" class="d-icon" data-edit="${r.id}" title="Edit" aria-label="Edit">✎</button>
+      <button type="button" class="d-icon d-icon-danger" data-del="${r.id}" title="Delete" aria-label="Delete">${ICONS.trash}</button>
+    </div>
+  </div>`;
+}
 
 async function openDetails() {
   details.open = true;
   if (!$("screen").hidden) closeScreen(); // one right-hand panel at a time
   details.routines = [];
+  details.form = null;
   renderDetails();
   try { details.routines = await api("GET", `/api/bots/${activeId}/routines`); } catch {}
   renderDetails();
 }
-function closeDetails() { details.open = false; renderDetails(); }
+function closeDetails() { details.open = false; details.form = null; renderDetails(); }
 
 function renderDetails() {
   const el = $("details");
@@ -548,10 +615,10 @@ function renderDetails() {
   el.hidden = !details.open || !b;
   if (el.hidden) return;
   const toggle = (on, attrs) => `<button type="button" class="switch ${on ? "on" : ""}" ${attrs}><span></span></button>`;
-  const routines = details.routines.length
-    ? details.routines.map((r) => `<div class="d-item"><div class="d-text"><div>${esc(r.name)}</div><div class="d-sub">${esc(r.cron)}</div></div>
-        ${toggle(r.enabled, `data-routine="${r.id}" title="${r.enabled ? "Pause" : "Resume"}"`)}</div>`).join("")
-    : `<div class="d-item d-empty">No routines yet.</div>`;
+  const routines = `
+      ${details.routines.length ? details.routines.map(routineRowHtml).join("") : details.form ? "" : `<div class="d-item d-empty">No routines yet.</div>`}
+      ${details.form?.mode === "new" ? routineFormHtml() : ""}
+      <button type="button" class="d-item d-link d-new" id="d-new-routine">${ICONS.plus}<span>New routine</span></button>`;
   const activity = `
     <div class="d-section"><span>Suggested</span></div>
     <div class="d-card">
@@ -595,11 +662,51 @@ $("details").addEventListener("click", async (e) => {
   const t = e.target.closest("button");
   if (!t) return;
   if (t.id === "d-close") return closeDetails();
-  if (t.dataset.tab) { details.tab = t.dataset.tab; return renderDetails(); }
+  if (t.dataset.tab) { details.tab = t.dataset.tab; details.form = null; return renderDetails(); }
   if (t.dataset.prefill) { $("input").value = t.dataset.prefill; $("input").focus(); return; }
   if (t.id === "d-hide") return patchBot({ hidden: !bot(activeId).hidden });
+  if (t.id === "d-new-routine") {
+    details.form = { mode: "new", name: "", cron: "", instruction: "" };
+    renderDetails();
+    $("details").querySelector('[data-f="name"]')?.focus();
+    return;
+  }
+  if (t.id === "d-routine-cancel") { details.form = null; return renderDetails(); }
+  if (t.dataset.edit) {
+    const r = details.routines.find((x) => String(x.id) === t.dataset.edit);
+    if (!r) return;
+    details.form = { mode: "edit", id: r.id, name: r.name, cron: r.cron, instruction: r.instruction || "" };
+    renderDetails();
+    $("details").querySelector('[data-f="name"]')?.focus();
+    return;
+  }
+  if (t.dataset.del) {
+    const r = details.routines.find((x) => String(x.id) === t.dataset.del);
+    if (!r || !confirm(`Delete routine "${r.name}"?`)) return;
+    try {
+      await api("DELETE", `/api/routines/${r.id}`);
+      details.routines = details.routines.filter((x) => String(x.id) !== String(r.id));
+      if (String(details.form?.id) === String(r.id)) details.form = null;
+    } catch (err) { alert(err.message); }
+    return renderDetails();
+  }
+  if (t.dataset.run) {
+    const r = details.routines.find((x) => String(x.id) === t.dataset.run);
+    if (!r) return;
+    const label = t.innerHTML;
+    try {
+      await api("POST", `/api/routines/${r.id}/run`);
+      t.classList.add("started");
+      t.textContent = "Started";
+      setTimeout(() => {
+        if (t.isConnected) { t.classList.remove("started"); t.innerHTML = label; }
+      }, 1500);
+    } catch (err) { alert(err.message); }
+    return;
+  }
   if (t.dataset.routine) {
-    const r = details.routines.find((x) => x.id === t.dataset.routine);
+    const r = details.routines.find((x) => String(x.id) === t.dataset.routine);
+    if (!r) return;
     try { Object.assign(r, await api("PATCH", `/api/routines/${r.id}`, { enabled: !r.enabled })); } catch (err) { alert(err.message); }
     return renderDetails();
   }
@@ -611,6 +718,34 @@ $("details").addEventListener("click", async (e) => {
   }
 });
 $("details").addEventListener("change", (e) => { if (e.target.id === "d-harness") patchBot({ harness: e.target.value }); });
+$("details").addEventListener("input", (e) => {
+  const fld = e.target.closest?.("[data-f]");
+  if (fld && details.form) details.form[fld.dataset.f] = fld.value;
+});
+$("details").addEventListener("submit", async (e) => {
+  if (e.target.id !== "d-routine-form") return;
+  e.preventDefault();
+  const f = details.form;
+  if (!f) return;
+  const name = f.name.trim(), cron = f.cron.trim();
+  if (!name || !cron) return alert("Name and cron are required.");
+  const save = $("d-routine-save");
+  if (save) save.disabled = true;
+  try {
+    const body = { name, cron, instruction: f.instruction };
+    const r = f.mode === "new"
+      ? await api("POST", `/api/bots/${activeId}/routines`, body)
+      : await api("PATCH", `/api/routines/${f.id}`, body);
+    const i = details.routines.findIndex((x) => String(x.id) === String(r.id));
+    if (i >= 0) details.routines[i] = r; else details.routines.push(r);
+    details.form = null;
+  } catch (err) {
+    alert(err.message);
+    if (save) save.disabled = false;
+    return;
+  }
+  renderDetails();
+});
 $("details").addEventListener("keydown", (e) => { if (e.target.id === "d-name" && e.key === "Enter") e.target.blur(); });
 $("details").addEventListener("focusout", (e) => {
   if (e.target.id !== "d-name") return;
@@ -618,7 +753,11 @@ $("details").addEventListener("focusout", (e) => {
   if (name && name !== bot(activeId)?.name) patchBot({ name });
   else e.target.value = bot(activeId)?.name ?? "";
 });
-document.addEventListener("keydown", (e) => { if (e.key === "Escape" && details.open && $("nb").hidden) closeDetails(); });
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape" || !details.open || !$("nb").hidden) return;
+  if (details.form) { details.form = null; return renderDetails(); }
+  closeDetails();
+});
 
 $("hidden-btn").addEventListener("click", () => { showHidden = !showHidden; renderSidebar(); });
 $("search-btn").addEventListener("click", () => {

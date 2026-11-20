@@ -109,6 +109,7 @@ async fn main() {
         .route("/bots/{id}/stop", post(stop_bot))
         .route("/bots/{id}/routines", get(list_routines).post(create_routine))
         .route("/routines/{id}", patch(update_routine).delete(delete_routine))
+        .route("/routines/{id}/run", post(run_routine))
         .route("/bots/{id}/screen", get(screen_info))
         .route("/upload", post(upload))
         .route("/ask", post(ask))
@@ -590,6 +591,16 @@ async fn update_routine(State(app): State<AppState>, Path(id): Path<String>, Jso
     }
     app.db.update_routine(&id, v["name"].as_str(), cron_expr, v["instruction"].as_str(), v["enabled"].as_bool());
     Ok(Json(json!(app.db.routine(&id))))
+}
+
+/// Runs a routine now, the same way the scheduler does (the run shows in the Bot's chat).
+async fn run_routine(State(app): State<AppState>, Path(id): Path<String>) -> Res {
+    let r = app.db.routine(&id).ok_or_else(|| not_found("Routine"))?;
+    let text = format!("{}: {}", r.name, r.instruction);
+    let msg = app.db.add_message(&r.bot_id, "routine", &text, None, false, Some("queued"));
+    app.push_message(&msg);
+    app.enqueue(msg);
+    Ok(Json(json!({ "ok": true })))
 }
 
 async fn delete_routine(State(app): State<AppState>, Path(id): Path<String>) -> Res {

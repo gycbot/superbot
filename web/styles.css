@@ -317,6 +317,45 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
 .switch.on { background: var(--blue); }
 .switch.on span { transform: translateX(16px); }
 
+/* Routines */
+.d-routine + .d-routine { border-top: 1px solid #242424; }
+.d-routine-main { padding-bottom: 6px; }
+.d-rname { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.d-last { color: var(--text-faint); font-size: 13.5px; }
+.d-tools { display: flex; flex-wrap: wrap; gap: 8px; padding: 0 16px 12px; }
+.d-icon {
+  min-width: 34px; height: 34px; padding: 0 9px; border-radius: 10px;
+  background: #232323; border: 1px solid #333; color: #cfcfcf;
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  font-size: 14px; line-height: 1; transition: background .15s, color .15s;
+}
+.d-icon:hover { background: #2c2c2c; color: #fff; }
+.d-icon svg { width: 16px; height: 16px; }
+.d-icon-danger { color: #f08a8a; }
+.d-icon.started { background: #1f3a24; border-color: #2f5c38; color: #8be0a0; }
+.d-new { color: var(--text-dim); }
+.d-new:hover { color: var(--text); }
+
+/* Inline routine form */
+.d-routine-form { display: flex; flex-direction: column; gap: 10px; padding: 12px 16px 16px; border-top: 1px solid #242424; }
+.d-form-title { font-size: 15px; font-weight: 600; color: var(--text); }
+.d-field { display: flex; flex-direction: column; gap: 6px; color: var(--text-dim); font-size: 14.5px; }
+.d-input {
+  width: 100%; background: #111; border: 1px solid #333; border-radius: 10px;
+  color: inherit; font: inherit; font-size: 15px; padding: 9px 12px; outline: none;
+}
+.d-input:focus { border-color: #4a4a4a; }
+textarea.d-input { min-height: 96px; resize: vertical; line-height: 1.45; }
+.d-form-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.d-btn {
+  padding: 8px 16px; border-radius: 999px; background: #232323; border: 1px solid #333;
+  color: var(--text); font-size: 15px; transition: background .15s;
+}
+.d-btn:hover { background: #2c2c2c; }
+.d-btn.primary { background: var(--blue); border-color: var(--blue); color: #fff; }
+.d-btn.primary:hover { background: #3b7ff0; }
+.d-btn:disabled { opacity: .6; cursor: default; }
+
 /* --- Mobile--- */
 .menu-btn { display: none; }
 .sidebar-backdrop { display: none; }
@@ -383,6 +422,7 @@ svg { width: 20px; height: 20px; fill: none; stroke: currentColor; stroke-width:
   .screen-bar span { font-size: 14px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .screen-take { flex-shrink: 0; padding: 7px 12px; font-size: 14px; white-space: nowrap; }
   .d-close { top: 10px; right: 10px; }
+  .d-icon { min-width: 38px; height: 38px; }
 
   /* New Bot dialog */
   .modal { border-radius: 18px; }

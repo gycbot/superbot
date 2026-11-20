@@ -428,7 +428,7 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 
 ## Routines
 - For recurring or scheduled work, use `{botctl}`. Run `{botctl} help` to see how.
-{screen}
+{screen}{toolbox}
 ## Style
 - Reply like a teammate in chat: short, plain English. Markdown is fine.
 - Each separate text block you write is shown as its own chat bubble. Before long work, send a one-line heads-up.
@@ -455,6 +455,10 @@ Current time: {now}."#,
             mem = read(self.memory_file(&bot.id)),
             user_facts = read(self.user_file()),
             others = if others.is_empty() { "None yet.".into() } else { others.join("\n") },
+            toolbox = {
+                let t = read(self.cfg.data_dir.join("TOOLS.md"));
+                if t.is_empty() { String::new() } else { format!("\n## Toolbox (tools and conventions on this computer)\n{t}\n") }
+            },
             now = chrono::Local::now().format("%A, %B %-d, %Y, %H:%M (UTC%:z)"),
         )
     }

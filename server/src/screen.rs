@@ -117,7 +117,8 @@ impl Screens {
         let _ = std::fs::remove_file(format!("/tmp/.X{n}-lock"));
         let _ = std::fs::remove_file(&sock);
         s.procs.push(spawn(Command::new("Xvfb").args([&display, "-screen", "0", &format!("{}x24", self.size), "-nolisten", "tcp"]))?);
-        for _ in 0..50 {
+        // A busy, low-memory VPS can take several seconds to bring Xvfb up.
+        for _ in 0..150 {
             if sock.exists() {
                 break;
             }
