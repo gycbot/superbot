@@ -301,6 +301,7 @@ async fn web(uri: axum::http::Uri) -> Response {
         "/" | "/index.html" => "index.html",
         "/app.js" => "app.js",
         "/styles.css" => "styles.css",
+        "/theme.css" => "theme.css",
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     let kind = match file.rsplit('.').next() {
@@ -313,6 +314,7 @@ async fn web(uri: axum::http::Uri) -> Response {
         None => match file {
             "index.html" => include_str!("../../web/index.html"),
             "app.js" => include_str!("../../web/app.js"),
+            "theme.css" => include_str!("../../web/theme.css"),
             _ => include_str!("../../web/styles.css"),
         }
         .to_string(),
