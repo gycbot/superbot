@@ -295,6 +295,49 @@ async fn screen_proxy(Path(path): Path<String>, mut req: Request) -> Response {
     Response::from_parts(parts, axum::body::Body::new(body))
 }
 
+const ASSETS: [&str; 4] = ["styles.css", "theme.css", "app.js", "skin.js"];
+
+/// Current body of a web file: SKIN_DIR (theme layer only) > WEB_DIR > embedded.
+fn web_file(file: &str) -> String {
+    // SKIN_DIR: an on-disk override for the theme layer only (theme.css, skin.js), so a
+    // machine can restyle without rebuilding and upstream updates never clobber it.
+    let skin = matches!(file, "theme.css" | "skin.js")
+        .then(|| std::env::var("SKIN_DIR").ok().filter(|d| !d.is_empty()))
+        .flatten()
+        .and_then(|d| std::fs::read_to_string(PathBuf::from(d).join(file)).ok());
+    match (skin, WEB_DIR.get().unwrap()) {
+        (Some(s), _) => s,
+        (None, Some(dir)) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
+        (None, None) => match file {
+            "index.html" => include_str!("../../web/index.html"),
+            "app.js" => include_str!("../../web/app.js"),
+            "theme.css" => include_str!("../../web/theme.css"),
+            "skin.js" => include_str!("../../web/skin.js"),
+            _ => include_str!("../../web/styles.css"),
+        }
+        .to_string(),
+    }
+}
+
+/// Short content hash (FNV-1a 64) used as a cache-busting `?v=`.
+fn content_version(body: &str) -> String {
+    let h = body.bytes().fold(0xcbf29ce484222325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100000001b3));
+    format!("{:010x}", h & 0xff_ffff_ffff)
+}
+
+/// index.html with every asset reference pinned to its content hash, so any change to an
+/// asset (new build, WEB_DIR edit, SKIN_DIR swap) gives the browser a new URL.
+fn versioned_index() -> String {
+    let mut html = web_file("index.html");
+    for name in ASSETS {
+        let v = content_version(&web_file(name));
+        for attr in ["href", "src"] {
+            html = html.replace(&format!("{attr}=\"{name}\""), &format!("{attr}=\"{name}?v={v}\""));
+        }
+    }
+    html
+}
+
 async fn web(uri: axum::http::Uri) -> Response {
     let path = uri.path();
     let file = match path {
@@ -310,25 +353,15 @@ async fn web(uri: axum::http::Uri) -> Response {
         Some("js") => "text/javascript; charset=utf-8",
         _ => "text/css; charset=utf-8",
     };
-    // SKIN_DIR: an on-disk override for the theme layer only (theme.css, skin.js), so a
-    // machine can restyle without rebuilding and upstream updates never clobber it.
-    let skin = matches!(file, "theme.css" | "skin.js")
-        .then(|| std::env::var("SKIN_DIR").ok().filter(|d| !d.is_empty()))
-        .flatten()
-        .and_then(|d| std::fs::read_to_string(PathBuf::from(d).join(file)).ok());
-    let body = match (skin, WEB_DIR.get().unwrap()) {
-        (Some(s), _) => s,
-        (None, Some(dir)) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
-        (None, None) => match file {
-            "index.html" => include_str!("../../web/index.html"),
-            "app.js" => include_str!("../../web/app.js"),
-            "theme.css" => include_str!("../../web/theme.css"),
-            "skin.js" => include_str!("../../web/skin.js"),
-            _ => include_str!("../../web/styles.css"),
-        }
-        .to_string(),
+    let (body, cache) = if file == "index.html" {
+        (versioned_index(), "no-store")
+    } else {
+        let body = web_file(file);
+        // A matching ?v= means this exact content: safe to cache for good. Anything else: revalidate.
+        let pinned = uri.query().and_then(|q| q.strip_prefix("v=")).is_some_and(|v| v == content_version(&body));
+        (body, if pinned { "public, max-age=31536000, immutable" } else { "no-cache" })
     };
-    ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, "no-cache")], body).into_response()
+    ([(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, cache)], body).into_response()
 }
 
 // Live updates: one Server-Sent Events stream with everything.
