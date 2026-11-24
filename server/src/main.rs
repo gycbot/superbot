@@ -302,6 +302,7 @@ async fn web(uri: axum::http::Uri) -> Response {
         "/app.js" => "app.js",
         "/styles.css" => "styles.css",
         "/theme.css" => "theme.css",
+        "/skin.js" => "skin.js",
         _ => return (StatusCode::NOT_FOUND, "Not found").into_response(),
     };
     let kind = match file.rsplit('.').next() {
@@ -309,12 +310,20 @@ async fn web(uri: axum::http::Uri) -> Response {
         Some("js") => "text/javascript; charset=utf-8",
         _ => "text/css; charset=utf-8",
     };
-    let body = match WEB_DIR.get().unwrap() {
-        Some(dir) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
-        None => match file {
+    // SKIN_DIR: an on-disk override for the theme layer only (theme.css, skin.js), so a
+    // machine can restyle without rebuilding and upstream updates never clobber it.
+    let skin = matches!(file, "theme.css" | "skin.js")
+        .then(|| std::env::var("SKIN_DIR").ok().filter(|d| !d.is_empty()))
+        .flatten()
+        .and_then(|d| std::fs::read_to_string(PathBuf::from(d).join(file)).ok());
+    let body = match (skin, WEB_DIR.get().unwrap()) {
+        (Some(s), _) => s,
+        (None, Some(dir)) => std::fs::read_to_string(dir.join(file)).unwrap_or_default(),
+        (None, None) => match file {
             "index.html" => include_str!("../../web/index.html"),
             "app.js" => include_str!("../../web/app.js"),
             "theme.css" => include_str!("../../web/theme.css"),
+            "skin.js" => include_str!("../../web/skin.js"),
             _ => include_str!("../../web/styles.css"),
         }
         .to_string(),
