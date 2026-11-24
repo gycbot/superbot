@@ -38,9 +38,8 @@ fn env(key: &str, default: &str) -> String {
 }
 
 pub fn random_bytes(n: usize) -> Vec<u8> {
-    use std::io::Read;
     let mut b = vec![0u8; n];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("read /dev/urandom");
+    getrandom::fill(&mut b).expect("random bytes");
     b
 }
 
@@ -140,12 +139,19 @@ async fn main() {
     println!("Harnesses on PATH: {}. Default: {}.", adapters::installed().join(", "), app.cfg.default_harness);
     println!("Screens: {}.", if app.screens.is_some() { "on" } else { "off (install Xvfb and openbox to turn them on)" });
 
-    // On SIGTERM/SIGINT: stop agents (queued work runs after restart), then exit.
+    // On SIGTERM/SIGINT (Ctrl+C on Windows): stop agents (queued work runs after restart), then exit.
     let shutdown_app = app.clone();
     tokio::spawn(async move {
-        use tokio::signal::unix::{signal, SignalKind};
-        let (mut term, mut int) = (signal(SignalKind::terminate()).unwrap(), signal(SignalKind::interrupt()).unwrap());
-        tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let (mut term, mut int) = (signal(SignalKind::terminate()).unwrap(), signal(SignalKind::interrupt()).unwrap());
+            tokio::select! { _ = term.recv() => {}, _ = int.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = tokio::signal::ctrl_c().await;
+        }
         shutdown_app.shutdown();
         for _ in 0..60 {
             if shutdown_app.is_idle() {
@@ -315,6 +321,7 @@ async fn state(State(app): State<AppState>) -> Json<Value> {
     Json(json!({
         "me": { "name": env("USER_NAME", "You") },
         "harnesses": adapters::installed(),
+        "screens": app.screens.is_some(),
         "defaultHarness": app.cfg.default_harness,
         "bots": bots,
     }))
