@@ -12,6 +12,8 @@ const HELP: &str = r#"botctl: manage your routines (scheduled tasks).
   botctl routine rm <id>                           Delete a routine
   botctl routine pause <id> | resume <id>
   botctl bots                                      List all Bots
+  botctl runs                                      Your recent runs and their state
+  botctl why <run>                                 Timeline of one run: why it ran, what happened
   botctl ask "<Bot name or id>" "<message>"        Ask another Bot; prints its reply
   botctl handoff "<what you need>"                 Ask the user to take over your screen; waits for "Done"
 
@@ -22,18 +24,30 @@ Cron has 5 fields in the server's local time: minute hour day month weekday.
 When a routine fires, you get "<what to do>" as a message and your reply goes to the user's chat.
 Confirm the schedule with the user in plain words.
 
+A run that fails is retried on its own. Use `runs` and `why` to see what happened
+before you ask the user to resend anything.
+
 `ask` and `handoff` can take minutes: run them with a long command timeout (10 minutes).
 If the other Bot takes longer, its reply arrives later as a new message."#;
 
 fn api(method: &str, path: &str, body: Option<String>) -> Result<String, String> {
+    api_with(method, path, body, "")
+}
+
+fn api_text(path: &str) -> Result<String, String> {
+    api_with("GET", path, None, "text/plain")
+}
+
+fn api_with(method: &str, path: &str, body: Option<String>, accept: &str) -> Result<String, String> {
     let (Ok(base), Ok(token)) = (std::env::var("BOT_API"), std::env::var("BOT_TOKEN")) else {
         return Err("botctl only works inside a Bot run (BOT_API and BOT_TOKEN are missing).".into());
     };
     let addr = base.trim_start_matches("http://").trim_end_matches('/');
     let mut s = TcpStream::connect(addr).map_err(|e| format!("Can't reach the server: {e}"))?;
     let body = body.unwrap_or_default();
+    let accept = if accept.is_empty() { String::new() } else { format!("Accept: {accept}\r\n") };
     let req = format!(
-        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        "{method} {path} HTTP/1.0\r\nHost: {addr}\r\nAuthorization: Bearer {token}\r\n{accept}Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
         body.len()
     );
     s.write_all(req.as_bytes()).map_err(|e| e.to_string())?;
@@ -81,6 +95,8 @@ fn run(args: &[String]) -> Result<String, String> {
             api("PATCH", &format!("/api/routines/{id}"), Some(body)).map(|_| if *cmd == "pause" { "Paused." } else { "Resumed." }.into())
         }
         ["bots"] => api("GET", "/api/bots", None),
+        ["runs"] => api_text(&format!("/api/bots/{bot}/runs")),
+        ["why", id] => api_text(&format!("/api/runs/{id}")),
         ["ask", to, message] => {
             let body = format!("{{\"from\":{},\"to\":{},\"text\":{}}}", json_str(&bot), json_str(to), json_str(message));
             api("POST", "/api/ask", Some(body))

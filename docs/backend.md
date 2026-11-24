@@ -5,7 +5,7 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 ## How it works
 
 - **Bots** live in SQLite. Each Bot has a harness (`claude`, `codex`, or `pi`), an optional model, and a harness session id.
-- **A message** is queued. Each Bot runs one task at a time, in order. Different Bots run in parallel.
+- **A message** becomes a row in `runs` (SQLite). Each Bot claims one run at a time, in order. Different Bots run in parallel.
 - **A run** spawns the harness CLI in the shared workspace, streams its JSON events, and saves each text block as a chat bubble.
 - **Live updates** go to the browser over one Server-Sent Events stream: new messages, streaming text, and what the Bot is doing ("Running: ls").
 - **Memory** is plain files, re-sent in the system prompt every run. The Bot edits them itself:
@@ -16,7 +16,9 @@ One Rust binary, `botd`. It serves the web app, stores everything in SQLite, and
 - **Bot to Bot**: a Bot runs `botctl ask "<Bot>" "<message>"`. The other Bot answers in its own chat and the reply prints back. If it takes over 9 minutes, the reply arrives later as a new message.
 - **Model and effort** are saved per Bot. The web app shows a faint picker above the input. Unset means the harness default.
 - **Choice cards**: a reply ending in a ` ```question ` JSON block becomes a multiple-choice card.
-- **Restarts**: queued messages run after a restart. A task that was running is reported as interrupted, not re-run, so it can't repeat an action like sending an email.
+- **Restarts**: the queue is SQLite, so nothing queued is lost. A run that was in flight is put back in the queue: one that had started resumes the same harness session, one that never started begins clean. The prompt tells the Bot to check what is already done before repeating anything with side effects.
+- **Retries**: a run that fails with no reply is retried after 30 s, 1 min, 2 min, 5 min, up to four attempts. Config and auth errors are not retried. The user sees one note and does not have to resend.
+- **Why**: every run keeps a short timeline (`queued`, `claim`, `session-lost`, `retry`, `done`, `failed`, `recovered`). `botctl runs` lists recent runs and `botctl why <id>` prints one timeline.
 
 ## Harness adapters
 
@@ -73,6 +75,7 @@ All JSON. Browser auth: HTTP Basic with `AUTH_PASSWORD`.
 - `PATCH|DELETE /api/routines/:id` `{enabled?, name?, cron?, instruction?}`
 - `GET /api/bots/:id/screen`: starts the Bot's screen and returns its live view URL
 - `POST /api/handoff` `{from, text}`: `botctl handoff`; waits for the user's answer
+- `GET /api/bots/:id/runs`: recent runs. `GET /api/runs/:id`: one run and its timeline. Both return plain text when the request sends `Accept: text/plain` (that is what `botctl` does)
 
 ## Not built yet
 

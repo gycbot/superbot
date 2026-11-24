@@ -2,6 +2,7 @@
 //! on its harness (Claude Code, Codex, or Pi); serves the web app and its API.
 
 mod adapters;
+mod auth_session;
 mod cron;
 mod db;
 mod runner;
@@ -75,6 +76,7 @@ async fn main() {
     let workspace = abs(env("WORKSPACE_DIR", "workspace"));
     std::fs::create_dir_all(&data_dir).expect("create DATA_DIR");
     std::fs::create_dir_all(&workspace).expect("create WORKSPACE_DIR");
+    auth_session::init(&data_dir);
     let db = Db::open(&data_dir.join("app.sqlite")).expect("open database");
 
     let screens = screen::Screens::from_env(data_dir.join("screens"));
@@ -110,6 +112,8 @@ async fn main() {
         .route("/bots/{id}/routines", get(list_routines).post(create_routine))
         .route("/routines/{id}", patch(update_routine).delete(delete_routine))
         .route("/routines/{id}/run", post(run_routine))
+        .route("/bots/{id}/runs", get(list_runs))
+        .route("/runs/{id}", get(run_detail))
         .route("/bots/{id}/screen", get(screen_info))
         .route("/upload", post(upload))
         .route("/ask", post(ask))
@@ -125,6 +129,7 @@ async fn main() {
         .with_state(app.clone());
 
     app.recover();
+    app.start_scheduler();
     cron::start(app.clone());
     if app.screens.is_some() {
         let app = app.clone();
@@ -180,26 +185,36 @@ fn not_found(what: &str) -> ApiError {
 
 type Res<T = Json<Value>> = Result<T, ApiError>;
 
-// Auth: browser login with AUTH_PASSWORD (any username), or the Bots' token for `botctl`.
+// Auth: browser login with AUTH_PASSWORD (any username) issues a 30-day signed
+// cookie; `botctl` uses the Bots' Bearer token.
 
 async fn auth(State(app): State<AppState>, req: Request, next: Next) -> Response {
-    let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let h = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+    let cookie = req.headers().get(header::COOKIE).and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
     let password = PASSWORD.get().unwrap();
+    let basic_ok = h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
+        let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
+        same(pass, password.as_bytes())
+    });
     let ok = password.is_empty()
         || h.strip_prefix("Bearer ").is_some_and(|t| same(t.as_bytes(), app.cfg.bot_token.as_bytes()))
-        || h.strip_prefix("Basic ").and_then(base64_decode).is_some_and(|creds| {
-            let pass = creds.splitn(2, |b| *b == b':').nth(1).unwrap_or_default();
-            same(pass, password.as_bytes())
-        });
+        || basic_ok
+        || auth_session::cookie_ok(&cookie, password);
     if ok {
-        next.run(req).await
+        let mut res = next.run(req).await;
+        if basic_ok {
+            if let Ok(v) = header::HeaderValue::from_str(&auth_session::set_cookie_header(password)) {
+                res.headers_mut().append(header::SET_COOKIE, v);
+            }
+        }
+        res
     } else {
         (StatusCode::UNAUTHORIZED, [(header::WWW_AUTHENTICATE, "Basic realm=\"Bots\"")], "Login required").into_response()
     }
 }
 
 /// Constant-time comparison.
-fn same(a: &[u8], b: &[u8]) -> bool {
+pub(crate) fn same(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
@@ -564,6 +579,69 @@ async fn handoff(State(app): State<AppState>, Json(v): Json<Value>) -> Result<St
         Some(answer) => format!("The user answered: {answer}"),
         None => "The user hasn't answered yet. Stop here and tell them in one line what you need. You'll get their answer as a new message.".into(),
     })
+}
+
+// Runs: what each Bot did, and why. `botctl runs` and `botctl why` read these.
+
+fn wants_text(h: &HeaderMap) -> bool {
+    h.get(header::ACCEPT).and_then(|v| v.to_str().ok()).is_some_and(|a| a.contains("text/plain"))
+}
+
+fn stamp(ms: Option<i64>) -> String {
+    ms.and_then(chrono::DateTime::from_timestamp_millis)
+        .map(|t| t.with_timezone(&chrono::Local).format("%m-%d %H:%M:%S").to_string())
+        .unwrap_or_default()
+}
+
+async fn list_runs(State(app): State<AppState>, Path(id): Path<String>, headers: HeaderMap) -> Res<Response> {
+    need_bot(&app, &id)?;
+    let runs = app.db.runs(&id, 50);
+    if !wants_text(&headers) {
+        return Ok(Json(json!(runs)).into_response());
+    }
+    let mut out = String::new();
+    for r in &runs {
+        let note = r.error.as_deref().map(|e| e.lines().next().unwrap_or("")).unwrap_or("");
+        out.push_str(&format!(
+            "#{id} {state:<10} {kind:<8} attempt {n}  {at}  {note}\n",
+            id = r.id,
+            state = r.state,
+            kind = r.kind,
+            n = r.attempts,
+            at = stamp(Some(r.created_at)),
+        ));
+    }
+    if out.is_empty() {
+        out.push_str("No runs yet.\n");
+    }
+    Ok(out.into_response())
+}
+
+async fn run_detail(State(app): State<AppState>, Path(id): Path<i64>, headers: HeaderMap) -> Res<Response> {
+    let run = app.db.run(id).ok_or_else(|| not_found("Run"))?;
+    let facts = app.db.facts(id);
+    if !wants_text(&headers) {
+        return Ok(Json(json!({ "run": run, "facts": facts })).into_response());
+    }
+    let mut out = format!(
+        "Run #{id} · {state} · {kind} · attempt {n} · created {at}\n",
+        id = run.id,
+        state = run.state,
+        kind = run.kind,
+        n = run.attempts,
+        at = stamp(Some(run.created_at)),
+    );
+    if let Some(e) = &run.error {
+        out.push_str(&format!("  error: {}\n", first_line(e)));
+    }
+    for f in &facts {
+        out.push_str(&format!("{}  {:<12} {}\n", stamp(Some(f.at)), f.kind, f.detail));
+    }
+    Ok(out.into_response())
+}
+
+fn first_line(s: &str) -> String {
+    s.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim().chars().take(300).collect()
 }
 
 // Routines

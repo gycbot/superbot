@@ -2,10 +2,10 @@
 //! (identity, rules, memory), streams harness events to the web app, and saves replies.
 
 use crate::adapters::{self, AbortReason, AgentEvent, RunInput};
-use crate::db::{Bot, BotPatch, Db, Message};
+use crate::db::{self, Bot, BotPatch, Db, Message, NewRun, Run};
 use crate::screen::{self, Screens};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +26,8 @@ pub struct Config {
     pub default_model: Option<String>,
 }
 
-struct Run {
+/// A run in progress: how to stop it, and what to show in the UI meanwhile.
+struct Live {
     abort: watch::Sender<AbortReason>,
     status: String,
     draft: String,
@@ -34,10 +35,14 @@ struct Run {
 
 #[derive(Default)]
 struct BotState {
-    queue: VecDeque<Message>,
+    /// Advisory only: the database is the queue. Prevents two loops for one Bot.
     draining: bool,
-    run: Option<Run>,
+    run: Option<Live>,
 }
+
+/// A run retried this many times in total, then it is left failed.
+/// Each attempt spends the owner's real tokens, so the number stays small.
+const MAX_ATTEMPTS: i64 = 4;
 
 pub struct App {
     pub db: Db,
@@ -121,77 +126,80 @@ impl App {
         }
     }
 
+    /// Queues a message as a durable run, then wakes the Bot's loop.
     pub fn enqueue(self: &Arc<Self>, msg: Message) {
-        let bot_id = msg.bot_id.clone();
+        let id = self.db.enqueue_run(NewRun {
+            bot_id: msg.bot_id.clone(),
+            thread: "chat".into(),
+            kind: msg.role.clone(),
+            message_id: Some(msg.id),
+            from_bot: msg.from_bot.clone(),
+            prompt: prompt_for(self, &msg),
+        });
+        let from = msg.from_bot.as_deref().unwrap_or("the user");
+        self.db.fact(id, "queued", &format!("{} message {} from {from}", msg.role, msg.id));
+        self.wake(&msg.bot_id);
+    }
+
+    /// Starts the Bot's loop unless it is already running. The database decides
+    /// what to run, so a missed wake-up only costs the scheduler's next tick.
+    pub fn wake(self: &Arc<Self>, bot_id: &str) {
         let mut st = self.state();
-        let s = st.entry(bot_id.clone()).or_default();
-        s.queue.push_back(msg);
-        if !s.draining {
-            s.draining = true;
-            tokio::spawn(self.clone().drain(bot_id));
+        let s = st.entry(bot_id.to_string()).or_default();
+        if s.draining {
+            return;
         }
+        s.draining = true;
+        drop(st);
+        tokio::spawn(self.clone().drain(bot_id.to_string()));
     }
 
     async fn drain(self: Arc<Self>, bot_id: String) {
         loop {
             if self.closing.load(Ordering::SeqCst) {
-                return; // left as is: the next start picks it up
+                return; // the claim stays; the next start sweeps it back into the queue
             }
-            // Pop and "queue is empty, stop draining" happen under one lock, so nothing is dropped.
-            let next = {
-                let mut st = self.state();
-                let m = st.get_mut(&bot_id).and_then(|s| s.queue.pop_front());
-                if m.is_none() {
+            let Some(run) = self.db.claim_for(&bot_id, db::now()) else { break };
+            match self.db.bot(&bot_id) {
+                Some(bot) => self.run_one(bot, run).await,
+                None => self.db.finish_run(run.id, "cancelled", 0, Some("Bot was deleted")),
+            }
+        }
+        {
+            let mut st = self.state();
+            if let Some(s) = st.get_mut(&bot_id) {
+                s.draining = false;
+                if s.run.is_none() {
                     st.remove(&bot_id);
                 }
-                m
-            };
-            let Some(msg) = next else { break };
-            let before = self.db.last_id();
-            if let Some(bot) = self.db.bot(&bot_id) {
-                self.run_one(bot, &msg).await;
-            }
-            if self.closing.load(Ordering::SeqCst) {
-                return; // left "running": the next start reports it
-            }
-            self.db.set_status(msg.id, "done");
-            if msg.role == "peer" {
-                self.answer_peer(&msg, before);
             }
         }
         self.send(json!({ "type": "status", "botId": bot_id, "working": false }));
     }
 
-    async fn run_one(self: &Arc<Self>, mut bot: Bot, msg: &Message) {
+    async fn run_one(self: &Arc<Self>, mut bot: Bot, run: Run) {
         if adapters::get(&bot.harness).is_none() {
+            self.db.finish_run(run.id, "failed", 0, Some("Unknown harness"));
             return self.say(&bot.id, &format!("Unknown harness \"{}\".", bot.harness), true);
         }
         self.init_bot_files(&bot);
-        self.db.set_status(msg.id, "running");
-        let from = || msg.from_bot.as_deref().and_then(|id| self.db.bot(id)).map(|b| format!("{} (id {})", b.name, b.id)).unwrap_or("another Bot".into());
-        let mut prompt = match msg.role.as_str() {
-            "routine" => format!("(Scheduled routine) {}", msg.text),
-            "peer" => format!("(Message from {}, another Bot. Your reply goes back to them, not the user.)\n\n{}", from(), msg.text),
-            "reply" => format!("(Reply from {} to what you asked earlier. Tell the user what matters.)\n\n{}", from(), msg.text),
-            _ => msg.text.clone(),
-        };
-        // Tell the harness about files the user attached so it can inspect them with its tools.
-        if let Some(arr) = msg.attachments.as_ref().and_then(|a| a.as_array())
-            && !arr.is_empty() {
-            let lines: Vec<String> = arr.iter().map(|a| {
-                let kind = a["kind"].as_str().unwrap_or("file");
-                let name = a["name"].as_str().unwrap_or("file");
-                let id = a["id"].as_str().unwrap_or("");
-                format!("- [{}] {} — {}", kind, name, self.cfg.data_dir.join("uploads").join(id).display())
-            }).collect();
-            prompt.push_str("\n\n[User attached files — you may read/inspect these paths with your tools]\n");
-            prompt.push_str(&lines.join("\n"));
+        self.db.fact(run.id, "claim", &format!("attempt {} on {}", run.attempts, bot.harness));
+        if let Some(mid) = run.message_id {
+            self.db.set_status(mid, "running");
+        }
+        let mut session = run.session.clone();
+        let mut prompt = run.prompt.clone();
+        if run.attempts > 1 {
+            prompt.push_str(
+                "\n\n[Retry: an earlier attempt was cut off. Check what is already done before repeating \
+                 anything with side effects.]",
+            );
         }
 
-        for attempt in 0..2 {
+        for pass in 0..2 {
             let (abort_tx, abort_rx) = watch::channel(None);
             self.state().entry(bot.id.clone()).or_default().run =
-                Some(Run { abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new() });
+                Some(Live { abort: abort_tx.clone(), status: "Thinking".into(), draft: String::new() });
             self.send(json!({ "type": "status", "botId": bot.id, "working": true, "status": "Thinking" }));
             let timeout = self.cfg.run_timeout;
             let timer = tokio::spawn(async move {
@@ -214,7 +222,7 @@ impl App {
             let input = RunInput {
                 prompt: prompt.clone(),
                 system: self.system_prompt(&bot),
-                session_id: bot.session_id.clone(),
+                session_id: session.clone(),
                 cwd: self.cfg.workspace.clone(),
                 model: bot.model.clone(),
                 effort: bot.effort.clone(),
@@ -222,11 +230,14 @@ impl App {
                 state_dir: self.bot_dir(&bot.id),
             };
 
+            let before = self.db.last_id();
+            let run_id = run.id;
             let mut errors: Vec<String> = Vec::new();
             let mut replies = 0;
             let id = bot.id.clone();
             adapters::run(adapters::get(&bot.harness).unwrap(), input, abort_rx.clone(), |e| match e {
                 AgentEvent::Session(s) => {
+                    self.db.started_run(run_id, &s);
                     if self.db.bot(&id).and_then(|b| b.session_id).as_deref() != Some(&s) {
                         self.db.update_bot(&id, BotPatch { session_id: Some(Some(s)), ..Default::default() });
                     }
@@ -256,6 +267,13 @@ impl App {
                 self.say(&id, &draft, false);
             }
 
+            let reason = *abort_rx.borrow();
+            // A shutdown leaves the run claimed on purpose: the next start sweeps
+            // it back into the queue and resumes the same session.
+            if reason == Some("shutdown") {
+                return;
+            }
+
             // The harness lost its session (e.g. its files were wiped): start fresh once.
             let lost = errors.iter().any(|m| {
                 let m = m.to_lowercase();
@@ -263,28 +281,68 @@ impl App {
                     || ((m.contains("session") || m.contains("conversation"))
                         && (m.contains("not found") || m.contains("no such") || m.contains("does not exist")))
             });
-            if lost && bot.session_id.is_some() && replies == 0 && attempt == 0 {
+            if lost && session.is_some() && replies == 0 && pass == 0 {
                 self.db.update_bot(&id, BotPatch { session_id: Some(None), ..Default::default() });
+                self.db.fact(run_id, "session-lost", &first_line(&errors.join("; ")));
                 bot.session_id = None;
+                session = None;
                 continue;
             }
 
-            match *abort_rx.borrow() {
-                Some("shutdown") => {}
-                Some("stopped") => self.say(&id, "Stopped.", true),
-                Some("timeout") => {
-                    let mins = self.cfg.run_timeout.as_secs() / 60;
-                    self.say(&id, &format!("I hit the {mins} minute limit for one task and stopped."), true)
+            if reason == Some("stopped") {
+                self.say(&id, "Stopped.", true);
+                self.db.fact(run_id, "cancelled", "stopped by the user");
+                self.db.finish_run(run_id, "cancelled", replies, Some("Stopped."));
+            } else if let Some("timeout") = reason {
+                let mins = self.cfg.run_timeout.as_secs() / 60;
+                let msg = format!("I hit the {mins} minute limit for one task and stopped.");
+                self.say(&id, &msg, true);
+                self.db.fact(run_id, "timeout", &msg);
+                self.db.finish_run(run_id, "failed", replies, Some(&msg));
+                run_end_hook(&bot, &run, "failed", &msg);
+            } else if !errors.is_empty() {
+                let msg = errors.join("\n\n");
+                if replies == 0 && run.attempts < MAX_ATTEMPTS && !is_fatal(&msg) {
+                    let delay = backoff(run.attempts);
+                    self.db.requeue_run(run.id, db::now() + delay, &msg);
+                    self.db.fact(
+                        run_id,
+                        "retry",
+                        &format!("attempt {}: {}; next in {}s", run.attempts, first_line(&msg), delay / 1000),
+                    );
+                    if run.attempts == 1 {
+                        self.say(
+                            &id,
+                            &format!("Hit an error. Retrying in {} — no need to resend.\n\n{}", human_delay(delay), first_line(&msg)),
+                            true,
+                        );
+                    }
+                    return;
                 }
-                _ if !errors.is_empty() => self.say(&id, &errors.join("\n\n"), true),
-                _ if replies == 0 => self.say(&id, "Done.", false),
-                _ => {}
+                self.say(&id, &msg, true);
+                self.db.fact(run_id, "failed", &first_line(&msg));
+                self.db.finish_run(run_id, "failed", replies, Some(&msg));
+                run_end_hook(&bot, &run, "failed", &msg);
+            } else {
+                if replies == 0 {
+                    self.say(&id, "Done.", false);
+                }
+                self.db.fact(run_id, "done", &format!("{replies} repl{}", if replies == 1 { "y" } else { "ies" }));
+                self.db.finish_run(run_id, "done", replies, None);
+                run_end_hook(&bot, &run, "done", "");
+            }
+            // Whoever asked this Bot waits for these bubbles as the answer, even when
+            // the run ended badly.
+            if run.kind == "peer"
+                && let Some(m) = run.message_id.and_then(|id| self.db.message(id))
+            {
+                self.answer_peer(&m, before);
             }
             return;
         }
     }
 
-    fn with_run<T: Default>(&self, bot_id: &str, f: impl FnOnce(&mut Run) -> T) -> T {
+    fn with_run<T: Default>(&self, bot_id: &str, f: impl FnOnce(&mut Live) -> T) -> T {
         self.state().get_mut(bot_id).and_then(|s| s.run.as_mut()).map(f).unwrap_or_default()
     }
 
@@ -354,16 +412,14 @@ impl App {
         self.push_message(&m);
     }
 
-    /// Stops the current task and drops queued ones.
+    /// Stops the current task and cancels queued ones.
     pub fn stop(&self, bot_id: &str) {
+        self.db.cancel_queued(bot_id);
         let mut st = self.state();
-        if let Some(s) = st.get_mut(bot_id) {
-            for m in s.queue.drain(..) {
-                self.db.set_status(m.id, "done");
-            }
-            if let Some(r) = &s.run {
-                r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
-            }
+        if let Some(s) = st.get_mut(bot_id)
+            && let Some(r) = &s.run
+        {
+            r.abort.send_if_modified(|v| v.get_or_insert("stopped") == &"stopped");
         }
     }
 
@@ -381,20 +437,48 @@ impl App {
         self.state().values().all(|s| s.run.is_none())
     }
 
-    /// After a restart: queued messages run. Interrupted ones are reported, not
-    /// re-run, because re-running could repeat actions like sending an email.
+    /// After a restart, runs that were in flight go back in the queue. One that had
+    /// started resumes its session; the prompt tells it to check its work first.
     pub fn recover(self: &Arc<Self>) {
-        for m in self.db.pending() {
-            if self.db.bot(&m.bot_id).is_none() {
-                continue;
-            }
-            if m.status.as_deref() == Some("running") {
-                self.db.set_status(m.id, "done");
-                self.say(&m.bot_id, "A server restart interrupted me before I finished. Send it again if you still need it.", true);
-            } else {
+        // First start after the upgrade from the in-memory queue: messages that
+        // were waiting then have no run yet, so requeue them once.
+        for m in self.db.orphan_messages() {
+            if self.db.bot(&m.bot_id).is_some() {
                 self.enqueue(m);
             }
         }
+        let now = db::now();
+        for (id, started) in self.db.sweep(now) {
+            let what = if started { "server restart; resuming the same session" } else { "server restart; starting fresh" };
+            self.db.fact(id, "recovered", what);
+        }
+    }
+
+    /// Wakes Bots with due work, and requeues claims whose process died.
+    pub fn start_scheduler(self: &Arc<Self>) {
+        let app = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut n = 0u64;
+            loop {
+                tick.tick().await;
+                for bot in app.db.due_bots(db::now()) {
+                    app.wake(&bot);
+                }
+                n += 1;
+                if n % 30 == 0 {
+                    let now = db::now();
+                    // A claim can only reach this age if nothing is watching it: a live
+                    // run is aborted by its own timeout first.
+                    let cutoff = now - app.cfg.run_timeout.as_millis() as i64 - 300_000;
+                    for (id, started) in app.db.sweep_stale(now, cutoff) {
+                        let what = if started { "no longer running; resuming the same session" } else { "no longer running; starting fresh" };
+                        app.db.fact(id, "recovered", what);
+                    }
+                }
+            }
+        });
     }
 
     fn system_prompt(&self, bot: &Bot) -> String {
@@ -428,11 +512,13 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 
 ## Routines
 - For recurring or scheduled work, use `{botctl}`. Run `{botctl} help` to see how.
+- Your recent runs: `{botctl} runs`. One run's timeline: `{botctl} why <id>`.
 {screen}{toolbox}
 ## Style
 - Reply like a teammate in chat: short, plain English. Markdown is fine.
 - Each separate text block you write is shown as its own chat bubble. Before long work, send a one-line heads-up.
 - Ask before anything you can't undo: sending messages, publishing, deleting, paying.
+- If you are resuming after an interruption, check what is already done before repeating anything with side effects.
 - To ask a multiple-choice question, end your reply with this block, and nothing after it:
 ```question
 {{"title": "Your question?", "options": ["First", "Second", "Third"]}}
@@ -541,6 +627,75 @@ fn collect_media(app: &App, text: &str) -> (String, Vec<Value>) {
 }
 
 /// Splits off a trailing ```question {json}``` block.
+/// The prompt for one message, built once when the run is queued so a retry
+/// repeats the same task even if the chat has moved on.
+fn prompt_for(app: &App, msg: &Message) -> String {
+    let from = || {
+        msg.from_bot
+            .as_deref()
+            .and_then(|id| app.db.bot(id))
+            .map(|b| format!("{} (id {})", b.name, b.id))
+            .unwrap_or("another Bot".into())
+    };
+    let mut prompt = match msg.role.as_str() {
+        "routine" => format!("(Scheduled routine) {}", msg.text),
+        "peer" => format!("(Message from {}, another Bot. Your reply goes back to them, not the user.)\n\n{}", from(), msg.text),
+        "reply" => format!("(Reply from {} to what you asked earlier. Tell the user what matters.)\n\n{}", from(), msg.text),
+        _ => msg.text.clone(),
+    };
+    // Tell the harness about files the user attached so it can inspect them with its tools.
+    if let Some(arr) = msg.attachments.as_ref().and_then(|a| a.as_array())
+        && !arr.is_empty()
+    {
+        let lines: Vec<String> = arr
+            .iter()
+            .map(|a| {
+                let kind = a["kind"].as_str().unwrap_or("file");
+                let name = a["name"].as_str().unwrap_or("file");
+                let id = a["id"].as_str().unwrap_or("");
+                format!("- [{}] {} — {}", kind, name, app.cfg.data_dir.join("uploads").join(id).display())
+            })
+            .collect();
+        prompt.push_str("\n\n[User attached files — you may read/inspect these paths with your tools]\n");
+        prompt.push_str(&lines.join("\n"));
+    }
+    prompt
+}
+
+/// Errors that retrying cannot fix, so the run stops and tells the user.
+fn is_fatal(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    [
+        "api key",
+        "invalid_api_key",
+        "unauthorized",
+        "authentication",
+        "model not found",
+        "no such model",
+        "invalid model",
+        "does not have access",
+        "unknown harness",
+    ]
+    .iter()
+    .any(|p| m.contains(p))
+}
+
+/// Wait before the next attempt: 30 s, 1 min, 2 min, 5 min.
+fn backoff(attempts: i64) -> i64 {
+    const STEPS: [i64; 4] = [30_000, 60_000, 120_000, 300_000];
+    STEPS[(attempts.clamp(1, MAX_ATTEMPTS) as usize) - 1]
+}
+
+fn human_delay(ms: i64) -> String {
+    let s = ms / 1000;
+    if s < 60 { format!("{s} seconds") } else { format!("{} minutes", s / 60) }
+}
+
+fn first_line(msg: &str) -> String {
+    let line = msg.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    line.chars().take(200).collect()
+}
+
 fn split_question(text: &str) -> (&str, Option<Value>) {
     let t = text.trim_end();
     let Some(start) = t.rfind("```question") else { return (text, None) };
@@ -582,4 +737,29 @@ fn screen_prompt(botctl: &str) -> String {
 - When you need the user on your screen (a login, 2FA code, CAPTCHA, or payment check), run: {botctl} handoff "<what you need, in one line>". It waits until they finish, so give the command a 10 minute timeout. Never ask for passwords in chat.
 "#
     )
+}
+
+/// t3083: event-driven notice. When a run ends, run `RUN_END_HOOK` (if set) with
+/// state/bot/run info in env, so failures (and routine runs with no delivery) email the captain.
+fn run_end_hook(bot: &Bot, run: &Run, state: &str, msg: &str) {
+    let Ok(hook) = std::env::var("RUN_END_HOOK") else { return };
+    if hook.is_empty() {
+        return;
+    }
+    let mut cmd = tokio::process::Command::new(hook);
+    cmd.env("RUN_STATE", state)
+        .env("RUN_ID", run.id.to_string())
+        .env("RUN_KIND", &run.kind)
+        .env("RUN_CREATED_AT", run.created_at.to_string())
+        .env("RUN_BOT_ID", &bot.id)
+        .env("RUN_BOT_NAME", &bot.name)
+        .env("RUN_MSG", msg.chars().take(1500).collect::<String>())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    tokio::spawn(async move {
+        if let Ok(mut child) = cmd.spawn() {
+            let _ = child.wait().await;
+        }
+    });
 }
