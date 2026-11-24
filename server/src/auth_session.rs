@@ -7,6 +7,7 @@
 //! current AUTH_PASSWORD, so changing the password invalidates existing cookies.
 
 use std::io::{Read, Write};
+#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -40,6 +41,7 @@ fn load_or_create_key(path: &Path) -> Vec<u8> {
         std::fs::File::open(path)
             .and_then(|mut f| f.read_to_end(&mut raw))
             .unwrap_or_else(|e| panic!("read session key {}: {e}", path.display()));
+        #[cfg(unix)]
         if let Ok(meta) = std::fs::metadata(path) {
             let mut perms = meta.permissions();
             if perms.mode() & 0o077 != 0 {
@@ -60,10 +62,11 @@ fn load_or_create_key(path: &Path) -> Vec<u8> {
         std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("create session key dir: {e}"));
     }
     let key = crate::random_bytes(32);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut f = opts
         .open(path)
         .unwrap_or_else(|e| panic!("write session key {}: {e}", path.display()));
     let hex = hex_encode(&key);
