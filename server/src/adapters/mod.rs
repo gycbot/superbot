@@ -10,7 +10,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::watch;
 
@@ -49,6 +49,11 @@ pub trait Adapter: Send {
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>);
     /// Models this harness can run here, with their reasoning efforts. Blocking.
     fn models(&self) -> Vec<ModelOption>;
+    /// Send the user prompt on stdin instead of the command line.
+    /// Needed on Windows: .cmd shims go through cmd.exe, which truncates at 8191 chars.
+    fn prompt_stdin(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -77,10 +82,63 @@ pub fn models(name: &str) -> Vec<ModelOption> {
     list
 }
 
+/// Find an executable on PATH. On Windows, also tries PATHEXT (.exe/.cmd/...).
+pub fn which(bin: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    let exts: Vec<String> = if cfg!(windows) {
+        std::env::var("PATHEXT")
+            .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".into())
+            .split(';')
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_ascii_lowercase())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    for dir in std::env::split_paths(&path) {
+        // Windows: prefer real executables (.exe/.cmd/...) over extensionless shims.
+        for ext in &exts {
+            let candidate = dir.join(format!("{bin}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        let direct = dir.join(bin);
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    None
+}
+
+/// Builds a command. On Windows, .cmd/.bat shims are run through `cmd /C`.
+fn build(bin: &str, args: &[String]) -> std::process::Command {
+    if cfg!(windows)
+        && let Some(p) = which(bin)
+    {
+        let is_script = p
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| matches!(e.to_ascii_lowercase().as_str(), "cmd" | "bat"));
+        let mut c = if is_script {
+            let mut c = std::process::Command::new("cmd");
+            c.arg("/C").arg(p);
+            c
+        } else {
+            std::process::Command::new(p)
+        };
+        c.args(args);
+        return c;
+    }
+    let mut c = std::process::Command::new(bin);
+    c.args(args);
+    c
+}
+
 /// Runs a command and returns its stdout, or "" if it fails.
 pub fn output(bin: &str, args: &[&str]) -> String {
-    std::process::Command::new(bin)
-        .args(args)
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    build(bin, &args)
         .stdin(Stdio::null())
         .stderr(Stdio::null())
         .output()
@@ -97,7 +155,7 @@ pub fn get(name: &str) -> Option<Box<dyn Adapter>> {
     match name {
         "claude" => Some(Box::new(claude::Claude::default())),
         "codex" => Some(Box::new(codex::Codex)),
-        "pi" => Some(Box::new(pi::Pi)),
+        "pi" => Some(Box::new(pi::Pi::default())),
         _ => None,
     }
 }
@@ -108,11 +166,7 @@ pub fn installed() -> Vec<&'static str> {
         .into_iter()
         .filter(|n| {
             let bin = get(n).unwrap().bin();
-            std::process::Command::new("sh")
-                .args(["-c", &format!("command -v {bin}")])
-                .stdout(Stdio::null())
-                .status()
-                .is_ok_and(|s| s.success())
+            which(bin).is_some()
         })
         .collect()
 }
@@ -131,20 +185,27 @@ pub async fn run(
     let args = adapter.args(&input, &mut out);
     out.drain(..).for_each(&mut emit);
 
-    let mut child = match Command::new(adapter.bin())
-        .args(&args)
-        .current_dir(&input.cwd)
+    let use_stdin = adapter.prompt_stdin();
+    let mut cmd = Command::from(build(adapter.bin(), &args));
+    cmd.current_dir(&input.cwd)
         .envs(&input.env)
-        .stdin(Stdio::null())
+        .stdin(if use_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .process_group(0) // own group, so stop kills the whole tree
-        .kill_on_drop(true)
-        .spawn()
-    {
+        .kill_on_drop(true);
+    #[cfg(unix)]
+    cmd.process_group(0); // own group, so stop kills the whole tree
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return emit(AgentEvent::Error(format!("Couldn't start {}: {e}", adapter.bin()))),
     };
+    if use_stdin && let Some(mut stdin) = child.stdin.take() {
+        let prompt = input.prompt.clone();
+        tokio::spawn(async move {
+            let _ = stdin.write_all(prompt.as_bytes()).await;
+            let _ = stdin.shutdown().await;
+        });
+    }
     let pid = child.id();
 
     let mut stderr = child.stderr.take().unwrap();
@@ -198,10 +259,21 @@ pub async fn run(
 }
 
 fn kill_group(pid: u32, signal: &str) {
-    let _ = std::process::Command::new("kill")
-        .args([format!("-{signal}"), "--".into(), format!("-{pid}")])
-        .stderr(Stdio::null())
-        .status();
+    #[cfg(unix)]
+    {
+        let _ = std::process::Command::new("kill")
+            .args([format!("-{signal}"), "--".into(), format!("-{pid}")])
+            .stderr(Stdio::null())
+            .status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = signal;
+        let _ = std::process::Command::new("taskkill")
+            .args(["/T", "/F", "/PID", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status();
+    }
 }
 
 /// One short line describing a tool call, for the "working" status.

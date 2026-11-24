@@ -19,10 +19,25 @@ impl Adapter for Claude {
         self.id = input.session_id.clone().unwrap_or_else(new_uuid);
         let mut a: Vec<String> = [
             "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
-            "--dangerously-skip-permissions", "--append-system-prompt", &input.system,
+            "--dangerously-skip-permissions",
         ]
         .map(String::from)
         .into();
+        // On Windows the CLI is a .cmd shim, so the command line goes through cmd.exe.
+        // cmd.exe truncates at 8191 chars: pass the system prompt as a file instead.
+        let mut used_file = false;
+        if cfg!(windows)
+            && std::fs::create_dir_all(&input.state_dir).is_ok()
+        {
+            let file = input.state_dir.join("system-prompt.md");
+            if std::fs::write(&file, &input.system).is_ok() {
+                a.extend(["--append-system-prompt-file".into(), file.display().to_string()]);
+                used_file = true;
+            }
+        }
+        if !used_file {
+            a.extend(["--append-system-prompt".into(), input.system.clone()]);
+        }
         a.extend([if input.session_id.is_some() { "--resume" } else { "--session-id" }.into(), self.id.clone()]);
         if let Some(m) = &input.model {
             a.extend(["--model".into(), m.clone()]);
@@ -30,8 +45,14 @@ impl Adapter for Claude {
         if let Some(e) = &input.effort {
             a.extend(["--effort".into(), e.clone()]);
         }
-        a.extend(["--".into(), input.prompt.clone()]);
+        if !self.prompt_stdin() {
+            a.extend(["--".into(), input.prompt.clone()]);
+        }
         a
+    }
+
+    fn prompt_stdin(&self) -> bool {
+        cfg!(windows)
     }
 
     fn on_event(&mut self, e: &Value, out: &mut Vec<AgentEvent>) {

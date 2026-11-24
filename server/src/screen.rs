@@ -50,6 +50,10 @@ pub fn browser_session(bot_id: &str) -> String {
 
 impl Screens {
     pub fn from_env(run_dir: PathBuf) -> Option<Screens> {
+        // Screens need X11 (Xvfb, openbox, voxl). Not available on Windows.
+        if cfg!(windows) {
+            return None;
+        }
         let num = |k: &str, d: u64| crate::env(k, &d.to_string()).parse::<u64>().unwrap_or(d);
         if crate::env("SCREENS", "on") == "off" || !on_path("Xvfb") || !on_path("openbox") {
             return None;

@@ -212,8 +212,12 @@ impl App {
                 ("BOT_API".to_string(), self.cfg.api_url.clone()),
                 ("BOT_TOKEN".to_string(), self.cfg.bot_token.clone()),
             ]);
-            let path = std::env::var("PATH").unwrap_or_default();
-            env.insert("PATH".into(), format!("{}:{path}", self.cfg.bin_dir.display()));
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut paths = vec![self.cfg.bin_dir.clone()];
+            paths.extend(std::env::split_paths(&path));
+            if let Ok(joined) = std::env::join_paths(paths) {
+                env.insert("PATH".into(), joined.to_string_lossy().into_owned());
+            }
             if let Some(screens) = &self.screens
                 && let Some(info) = screens.ensure(&bot.id, |id| self.is_running(id)).await
             {
@@ -490,12 +494,14 @@ impl App {
         } else {
             ""
         };
+        let botctl = self.cfg.bin_dir.join(if cfg!(windows) { "botctl.exe" } else { "botctl" });
+        let os = if cfg!(windows) { "Windows" } else { "Linux" };
         format!(
             r#"You are {name}, an AI teammate of {user}.{primary}
 They talk to you in a chat app, like messaging a coworker. Finish work end to end.
 
 ## Your computer
-- You run on a Linux computer shared with the user's other Bots. Your working folder is {ws}.
+- You run on a {os} computer shared with the user's other Bots. Your working folder is {ws}.
 - Files, browser sign-ins, and credentials on it are shared by all Bots. Keep durable work in clear project folders.
 
 ## Memory
@@ -531,9 +537,10 @@ They talk to you in a chat app, like messaging a coworker. Finish work end to en
 
 Current time: {now}."#,
             name = bot.name,
+            os = os,
             // Full path: some harnesses run commands in a login shell that resets PATH.
-            botctl = self.cfg.bin_dir.join("botctl").display(),
-            screen = if self.screens.is_some() { screen_prompt(&self.cfg.bin_dir.join("botctl").display().to_string()) } else { String::new() },
+            botctl = botctl.display(),
+            screen = if self.screens.is_some() { screen_prompt(&botctl.display().to_string()) } else { String::new() },
             user = self.cfg.user_name,
             ws = self.cfg.workspace.display(),
             mem_path = self.memory_file(&bot.id).display(),
@@ -578,9 +585,8 @@ fn store_local_file(app: &App, path: &str) -> Option<Value> {
 }
 
 fn fastrand_byte() -> u8 {
-    use std::io::Read;
     let mut b = [0u8; 1];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).map(|_| b[0])
+    getrandom::fill(&mut b).map(|_| b[0])
         .unwrap_or_else(|_| (std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos() & 0xff) as u8)
 }
 

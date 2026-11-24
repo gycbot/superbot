@@ -424,6 +424,7 @@ async function load(refresh) {
   const state = await api("GET", "/api/state");
   me = state.me;
   harnesses = state.harnesses;
+  $("screen-btn").hidden = !state.screens;
   defaultHarness = state.defaultHarness;
   bots = state.bots;
   if (refresh) for (const id of Object.keys(messages)) messages[id] = await api("GET", `/api/bots/${id}/messages`);
